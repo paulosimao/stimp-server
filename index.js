@@ -8,8 +8,7 @@ var mongo = require('mongodb').MongoClient;
 var EventEmitter = require('events');
 var ll = require('lillog');
 /**
- *
- * module.exports.CMD_CONNECT = 'CONNECT';
+ module.exports.CMD_CONNECT = 'CONNECT';
  module.exports.CMD_CONNECTED = 'CONNECTED';
  module.exports.CMD_SEND = 'SEND';
  module.exports.CMD_SUBSCRIBE = 'SUBSCRIBE';
@@ -25,127 +24,200 @@ var ll = require('lillog');
  module.exports.CMD_ERROR = 'ERROR';
  */
 module.exports = function () {
-    var ret = {};
+    var server = {};
     var tcpserver = {};
     var subscriptions = new EventEmitter();
-    ret.config = {
+    server.config = {
         serverport: 61613,
         mongourl: 'mongodb://localhost:27017/stimp'
     };
 
+    var socketwrapper = function (sock) {
+        var ret = {
+            sock: sock,
+            uuid: stimpcommons.uuid(),
+            parser: stimpcommons.createparser(sock),
+            socksubscriptions: {},
+            onstomp: function (msg) {
+                var retmsg = stimpcommons.createmsg(stimpcommons.CMD_CONNECTED);
+                retmsg.addheader('version', '1.2');
+                retmsg.addheader('session', stimpcommons.uuid());
+                //In case msg was sent w receipt, we reply w it
+                if (msg.headers.receipt) {
+                    retmsg.addheader('receipt-id', msg.headers.receipt);
+                }
+                this.sock.write(retmsg.torawmsg());
+            },
+            ondisconnect: function (msg) {
 
-    ret.start = function () {
-        mongo.connect(ret.config.mongourl, function (err, db) {
+                for (dest in this.socksubscriptions) {
+                    subscriptions.removeListener(dest, ret.dodelivertosubscription);
+                }
+
+                var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
+                //In case msg was sent w receipt, we reply w it
+                if (msg.headers.receipt) {
+                    retmsg.addheader('receipt-id', msg.headers.receipt);
+                }
+                ret.sock.write(retmsg.torawmsg());
+                //TODO ADD CLEANUP CODE HERE
+                //sock.destroy();
+            },
+            onsend: function (msg) {
+                //ll.debug(JSON.stringify(msg));
+                var fwdmsg = stimpcommons.createmsg(stimpcommons.CMD_MESSAGE);
+                fwdmsg.headers = msg.headers;
+                fwdmsg.headers.subscription = fwdmsg.headers.destination;
+                fwdmsg.headers['message-id'] = fwdmsg.headers.receipt;
+                //delete fwdmsg.headers.destination;
+                fwdmsg.body = msg.body;
+                ret.dbsavemsgonsend(fwdmsg, function (err, data) {
+                    if (err) {
+                        //TODO SEND ERROR BACK TO CLIENT
+                        return ll.error(err);
+                    }
+                    ret.dofwdmsg(fwdmsg);
+                    var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
+                    if (msg.headers.receipt) {
+                        retmsg.addheader('receipt-id', msg.headers.receipt);
+                    }
+
+                    ret.sock.write(retmsg.torawmsg());
+                });
+            },
+            onsubscribe: function (msg) {
+                subscriptions.on(msg.headers.destination, ret.dodelivertosubscription);
+                ret.socksubscriptions[msg.headers.destination] = true;
+                var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
+                if (msg.headers.receipt) {
+                    retmsg.addheader('receipt-id', msg.headers.receipt);
+                }
+                ret.sock.write(retmsg.torawmsg());
+            },
+            onunsubscribe: function (msg) {
+                delete ret.socksubscriptions[msg.headers.destination];
+                subscriptions.removeListener(msg.headers.destination, ret.dodelivertosubscription);
+
+                var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
+                if (msg.headers.receipt) {
+                    retmsg.addheader('receipt-id', msg.headers.receipt);
+                }
+                ret.sock.write(retmsg.torawmsg());
+            },
+            onack: function (msg) {
+                ret.dbarchivemsg(msg.headers.id, false, function (err) {
+                    if (err) {
+                        //TODO SEND ERROR FRAME IN THIS CASE
+                        ll.error(err);
+                    }
+                })
+
+            },
+            onnack: function (msg) {
+                ret.dbarchivemsg(msg.headers.id, true, function (err) {
+                    if (err) {
+                        //TODO SEND ERROR FRAME IN THIS CASE
+                        ll.error(err);
+                    }
+                })
+            },
+            dofwdmsg: function (msg) {
+                try {
+                    if (msg.headers.destination.startsWith('/queue')) {
+                        var fwdmethod = subscriptions.listeners(msg.headers.destination)[0];
+                        fwdmethod(msg);
+                    } else {
+                        subscriptions.emit(msg.headers.destination, msg);
+                    }
+                } catch (err) {
+                    ll.debug(msg)
+                    ll.error(err)
+                }
+            },
+            dodelivertosubscription: function (msg) {
+                //ll.log('Sending:' + JSON.stringify(msg) + ' to:' + sock);
+                ret.sock.write(msg.torawmsg());
+            },
+
+            dbsavemsgonsend: function (msg, cb) {
+                server.db.collection(msg.headers.destination).insertOne(msg);
+                server.db.collection('msgindex').insertOne({
+                    msgid: msg.headers.receipt,
+                    destination: msg.headers.destination
+                }, cb);
+            },
+            dbarchivemsg: function (id, deadletter, cb) {
+                var finalcol = deadletter ? 'deadletter' : 'archive';
+                server.db.collection('msgindex').findOne({msgid: id}, function (err, doc) {
+                    var destcol = doc.destination;
+                    if (err) {
+                        return cb(err);
+                    }
+                    if (doc) {
+                        server.db.collection(destcol).findOne({'headers.message-id': id}, function (err, doc) {
+
+                            server.db.collection(finalcol + doc.headers.destination).insertOne(doc, function (err, data) {
+                                if (err) {
+                                    return cb(err);
+                                }
+                                server.db.collection(destcol).deleteOne({'headers.message-id': id}, function (err, data) {
+                                    if (err) {
+                                        ll.error(err);
+                                    }
+                                    server.db.collection('msgindex').deleteOne({msgid: id}, function (err, data) {
+                                        if (err) {
+                                            return cb(err);
+                                        } else {
+                                            cb(null);
+                                        }
+                                    });
+
+                                });
+
+                            });
+
+                        });
+                    }
+
+                });
+
+            },
+
+
+            init: function () {
+                ret.parser.on(stimpcommons.CMD_STOMP, ret.onstomp);
+                ret.parser.on(stimpcommons.CMD_CONNECT, ret.onstomp);
+                ret.parser.on(stimpcommons.CMD_DISCONNECT, ret.ondisconnect);
+                ret.parser.on(stimpcommons.CMD_SEND, ret.onsend);
+                ret.parser.on(stimpcommons.CMD_SUBSCRIBE, ret.onsubscribe);
+                ret.parser.on(stimpcommons.CMD_UNSUBSCRIBE, ret.onunsubscribe);
+                ret.parser.on(stimpcommons.CMD_ACK, ret.onack);
+                ret.parser.on(stimpcommons.CMD_NACK, ret.onnack);
+            }
+        }
+        ret.init();
+        return ret;
+    }
+
+
+    server.start = function () {
+        mongo.connect(server.config.mongourl, function (err, db) {
             if (err) {
                 ll.error(err);
                 process.exit(1);
             }
+            server.db = db;
             tcpserver = net.createServer(function (sock) {
-                sock.parser = stimpcommons.createparser(sock);
+                sock.wrapper = new socketwrapper(sock);
                 sock.on('error', function (err) {
                     ll.error(err);
                 });
-                sock.uuid = stimpcommons.uuid();
-                sock.delivertosubscription = function (msg) {
-                    ll.log('Sending:' + JSON.stringify(msg) + ' to:' + sock);
-                    sock.write(msg.torawmsg());
-                };
-                sock.parser.on('msg', function (msg) {
-                    db.collection('msgs').insertOne(msg);
-                    switch (msg.cmd) {
-                        case stimpcommons.CMD_STOMP:
-                        case stimpcommons.CMD_CONNECT:
-                            var retmsg = stimpcommons.createmsg(stimpcommons.CMD_CONNECTED);
-                            retmsg.addheader('version', '1.2');
-                            retmsg.addheader('session', stimpcommons.uuid());
-                            //In case msg was sent w receipt, we reply w it
-                            if (msg.headers.receipt) {
-                                retmsg.addheader('receipt-id', msg.headers.receipt);
-                            }
-                            sock.write(retmsg.torawmsg());
-                            break;
-                        case stimpcommons.CMD_CONNECTED:
-                            throw new Error('Server should not get a ' + msg.cmd + ' Frame');
-                            break;
-                        case stimpcommons.CMD_SEND:
-                            var fwdmsg = stimpcommons.createmsg(stimpcommons.CMD_MESSAGE);
-                            fwdmsg.headers = msg.headers;
-                            fwdmsg.headers.subscription = fwdmsg.headers.destination;
-                            fwdmsg.headers['message-id'] = fwdmsg.headers.receipt;
-                            //delete fwdmsg.headers.destination;
-                            fwdmsg.body = msg.body;
-
-                            subscriptions.emit(fwdmsg.headers.destination, fwdmsg);
-
-                            var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
-                            if (msg.headers.receipt) {
-                                retmsg.addheader('receipt-id', msg.headers.receipt);
-                            }
-
-                            sock.write(retmsg.torawmsg());
-                            break;
-                        case stimpcommons.CMD_SUBSCRIBE:
-                            subscriptions.on(msg.headers.destination, sock.delivertosubscription);
-                            var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
-                            if (msg.headers.receipt) {
-                                retmsg.addheader('receipt-id', msg.headers.receipt);
-                            }
-                            sock.write(retmsg.torawmsg());
-                            break;
-                        case stimpcommons.CMD_UNSUBSCRIBE:
-                            subscriptions.removeListener(msg.headers.destination, sock.delivertosubscription);
-                            var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
-                            if (msg.headers.receipt) {
-                                retmsg.addheader('receipt-id', msg.headers.receipt);
-                            }
-                            sock.write(retmsg.torawmsg());
-                            break;
-                        case stimpcommons.CMD_ACK:
-                            ll.debug(JSON.stringify(msg));
-                            break;
-                        case stimpcommons.CMD_NACK:
-                            ll.debug(JSON.stringify(msg));
-                            break;
-                        case stimpcommons.CMD_BEGIN:
-                            ll.debug(JSON.stringify(msg));
-                            break;
-                        case stimpcommons.CMD_COMMIT:
-                            ll.debug(JSON.stringify(msg));
-                            break;
-                        case stimpcommons.CMD_ABORT:
-                            ll.debug(JSON.stringify(msg));
-                            break;
-                        case stimpcommons.CMD_DISCONNECT:
-                            var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
-                            //In case msg was sent w receipt, we reply w it
-                            if (msg.headers.receipt) {
-                                retmsg.addheader('receipt-id', msg.headers.receipt);
-                            }
-                            sock.write(retmsg.torawmsg());
-                            //TODO ADD CLEANUP CODE HERE
-                            //sock.destroy();
-                            break;
-                        case stimpcommons.CMD_MESSAGE:
-                            throw new Error('Server should not get a ' + msg.cmd + ' Frame');
-                            break;
-                        case stimpcommons.CMD_RECEIPT:
-                            throw new Error('Server should not get a ' + msg.cmd + ' Frame');
-                            break;
-                        case stimpcommons.CMD_ERROR:
-                            throw new Error('Server should not get a ' + msg.cmd + ' Frame');
-                            break;
-                        default:
-                            break;
-
-                    }
-                });
-
             });
-            tcpserver.listen(ret.config.serverport, '127.0.0.1');
+            tcpserver.listen(server.config.serverport, '127.0.0.1');
         });
     };
-    ret.stop = function () {
+    server.stop = function () {
         tcpserver.close();
     };
-    return ret;
+    return server;
 };

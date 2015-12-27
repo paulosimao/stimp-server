@@ -1,0 +1,13 @@
+<component name="libraryTable">
+  <library name="stimp-commons" type="javaScript">
+    <properties>
+      <sourceFilesUrls>
+        <item url="file://$PROJECT_DIR$/../stimp-commons" />
+      </sourceFilesUrls>
+    </properties>
+    <CLASSES>
+      <root url="file://$PROJECT_DIR$/../stimp-commons" />
+    </CLASSES>
+    <SOURCES />
+  </library>
+</component>
