@@ -1,6 +1,6 @@
 {
   "name": "stimp-server",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Stomp server in Node.js. Please refer to readme.",
   "main": "index.js",
   "scripts": {

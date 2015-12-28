@@ -88,6 +88,7 @@ module.exports = function () {
             onsubscribe: function (msg) {
                 subscriptions.on(msg.headers.destination, ret.dodelivertosubscription);
                 ret.socksubscriptions[msg.headers.destination] = true;
+                ret.dbcheckpendingmsgs(msg.headers.destination);
                 var retmsg = stimpcommons.createmsg(stimpcommons.CMD_RECEIPT);
                 if (msg.headers.receipt) {
                     retmsg.addheader('receipt-id', msg.headers.receipt);
@@ -105,6 +106,7 @@ module.exports = function () {
                 ret.sock.write(retmsg.torawmsg());
             },
             onack: function (msg) {
+                console.log(JSON.stringify(msg));
                 ret.dbarchivemsg(msg.headers.id, false, function (err) {
                     if (err) {
                         //TODO SEND ERROR FRAME IN THIS CASE
@@ -181,6 +183,14 @@ module.exports = function () {
 
                 });
 
+            },
+            dbcheckpendingmsgs: function (destination) {
+                server.db.collection(destination).find({}).forEach(function (doc) {
+                    process.nextTick(function () {
+                        var msg = stimpcommons.addmethodstomsg(doc);
+                        ret.sock.write(msg.torawmsg());
+                    });
+                });
             },
 
 
