@@ -23,8 +23,8 @@ You can optionally set config options before calling start:
 - mongourl: The messaging backend  is based on mongodb (maybe we will get some plugins later for other backends). Set DB url here.
 
 ##### TODO:
-- Send pending messages to clients connected after message submission
-- Create proper behavior to queues and topics (at the moment everything behave like topics)
+- ~~Send pending messages to clients connected after message submission~~
+- ~~Create proper behavior to queues and topics (at the moment everything behave like topics)~~
 - Improve error handling
 - Improve message parsing (stimp-commons)
 - Implement in box clustering
